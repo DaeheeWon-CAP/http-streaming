@@ -27,7 +27,8 @@ const safeGetComputedStyle = function(el, property) {
     return '';
   }
 
-  return result[property];
+  //return result[property];
+  return '9999px'
 };
 
 /**

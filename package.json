@@ -1,6 +1,6 @@
 {
   "name": "@videojs/http-streaming",
-  "version": "1.10.3",
+  "version": "1.10.3-wavve.0.1",
   "description": "Play back HLS and DASH with Video.js, even where it's not natively supported",
   "main": "dist/videojs-http-streaming.cjs.js",
   "module": "dist/videojs-http-streaming.es.js",
@@ -73,7 +73,7 @@
     "mpd-parser": "0.8.1",
     "mux.js": "5.1.3",
     "url-toolkit": "^2.1.3",
-    "video.js": "^6.8.0 || ^7.0.0"
+    "video.js": "github:DaeheeWon-CAP/wavve-video.js#v7.6.0.wavve.0.0"
   },
   "devDependencies": {
     "@gkatsev/rollup-plugin-bundle-worker": "^1.0.2",
