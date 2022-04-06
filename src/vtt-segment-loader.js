@@ -4,9 +4,11 @@
 import SegmentLoader from './segment-loader';
 import videojs from 'video.js';
 import window from 'global/window';
-import { removeCuesFromTrack } from './mse/remove-cues-from-track';
+import { removeCuesFromTrack, removeDuplicateCuesFromTrack } from './util/text-tracks';
 import { initSegmentId } from './bin-utils';
 import { uint8ToUtf8 } from './util/string';
+import { REQUEST_ERRORS } from './media-segment-request';
+import { ONE_SECOND_IN_TS } from 'mux.js/lib/utils/clock';
 
 const VTT_LINE_TERMINATORS =
   new Uint8Array('\n\n'.split('').map(char => char.charCodeAt(0)));
@@ -27,6 +29,19 @@ export default class VTTSegmentLoader extends SegmentLoader {
     this.mediaSource_ = null;
 
     this.subtitlesTrack_ = null;
+
+    this.loaderType_ = 'subtitle';
+
+    this.featuresNativeTextTracks_ = settings.featuresNativeTextTracks;
+
+    // The VTT segment will have its own time mappings. Saving VTT segment timing info in
+    // the sync controller leads to improper behavior.
+    this.shouldSaveSegmentTimingInfo_ = false;
+  }
+
+  createTransmuxer_() {
+    // don't need to transmux any subtitles
+    return null;
   }
 
   /**
@@ -36,13 +51,13 @@ export default class VTTSegmentLoader extends SegmentLoader {
    *         TimeRange object representing the current buffered ranges
    */
   buffered_() {
-    if (!this.subtitlesTrack_ || !this.subtitlesTrack_.cues.length) {
+    if (!this.subtitlesTrack_ || !this.subtitlesTrack_.cues || !this.subtitlesTrack_.cues.length) {
       return videojs.createTimeRanges();
     }
 
     const cues = this.subtitlesTrack_.cues;
-    let start = cues[0].startTime;
-    let end = cues[cues.length - 1].startTime;
+    const start = cues[0].startTime;
+    const end = cues[cues.length - 1].startTime;
 
     return videojs.createTimeRanges([[start, end]]);
   }
@@ -52,12 +67,12 @@ export default class VTTSegmentLoader extends SegmentLoader {
    *
    * @param {Object} map
    *        The map object representing the init segment to get or set
-   * @param {Boolean=} set
+   * @param {boolean=} set
    *        If true, the init segment for the provided map should be saved
    * @return {Object}
    *         map object for desired init segment
    */
-  initSegment(map, set = false) {
+  initSegmentForMap(map, set = false) {
     if (!map) {
       return null;
     }
@@ -89,7 +104,7 @@ export default class VTTSegmentLoader extends SegmentLoader {
   /**
    * Returns true if all configuration required for loading is present, otherwise false.
    *
-   * @return {Boolean} True if the all configuration is ready for loading
+   * @return {boolean} True if the all configuration is ready for loading
    * @private
    */
   couldBeginLoading_() {
@@ -137,8 +152,9 @@ export default class VTTSegmentLoader extends SegmentLoader {
 
   /**
    * Remove any data in the source buffer between start and end times
-   * @param {Number} start - the start time of the region to remove from the buffer
-   * @param {Number} end - the end time of the region to remove from the buffer
+   *
+   * @param {number} start - the start time of the region to remove from the buffer
+   * @param {number} end - the end time of the region to remove from the buffer
    */
   remove(start, end) {
     removeCuesFromTrack(start, end, this.subtitlesTrack_);
@@ -154,22 +170,8 @@ export default class VTTSegmentLoader extends SegmentLoader {
    * @private
    */
   fillBuffer_() {
-    if (!this.syncPoint_) {
-      this.syncPoint_ = this.syncController_.getSyncPoint(this.playlist_,
-                                                          this.duration_(),
-                                                          this.currentTimeline_,
-                                                          this.currentTime_());
-    }
-
     // see if we need to begin loading immediately
-    let segmentInfo = this.checkBuffer_(this.buffered_(),
-                                        this.playlist_,
-                                        this.mediaIndex,
-                                        this.hasPlayed_(),
-                                        this.currentTime_(),
-                                        this.syncPoint_);
-
-    segmentInfo = this.skipEmptySegments_(segmentInfo);
+    const segmentInfo = this.chooseNextRequest_();
 
     if (!segmentInfo) {
       return;
@@ -178,7 +180,7 @@ export default class VTTSegmentLoader extends SegmentLoader {
     if (this.syncController_.timestampOffsetForTimeline(segmentInfo.timeline) === null) {
       // We don't have the timestamp offset that we need to sync subtitles.
       // Rerun on a timestamp offset or user interaction.
-      let checkTimestampOffset = () => {
+      const checkTimestampOffset = () => {
         this.state = 'READY';
         if (!this.paused()) {
           // if not paused, queue a buffer check as soon as possible
@@ -194,6 +196,15 @@ export default class VTTSegmentLoader extends SegmentLoader {
     this.loadSegment_(segmentInfo);
   }
 
+  // never set a timestamp offset for vtt segments.
+  timestampOffsetForSegment_() {
+    return null;
+  }
+
+  chooseNextRequest_() {
+    return this.skipEmptySegments_(super.chooseNextRequest_());
+  }
+
   /**
    * Prevents the segment loader from requesting segments we know contain no subtitles
    * by walking forward until we find the next segment that we don't know whether it is
@@ -206,13 +217,26 @@ export default class VTTSegmentLoader extends SegmentLoader {
    */
   skipEmptySegments_(segmentInfo) {
     while (segmentInfo && segmentInfo.segment.empty) {
-      segmentInfo = this.generateSegmentInfo_(
-        segmentInfo.playlist,
-        segmentInfo.mediaIndex + 1,
-        segmentInfo.startOfSegment + segmentInfo.duration,
-        segmentInfo.isSyncRequest);
+      // stop at the last possible segmentInfo
+      if (segmentInfo.mediaIndex + 1 >= segmentInfo.playlist.segments.length) {
+        segmentInfo = null;
+        break;
+      }
+      segmentInfo = this.generateSegmentInfo_({
+        playlist: segmentInfo.playlist,
+        mediaIndex: segmentInfo.mediaIndex + 1,
+        startOfSegment: segmentInfo.startOfSegment + segmentInfo.duration,
+        isSyncRequest: segmentInfo.isSyncRequest
+      });
     }
     return segmentInfo;
+  }
+
+  stopForError(error) {
+    this.error(error);
+    this.state = 'READY';
+    this.pause();
+    this.trigger('error');
   }
 
   /**
@@ -220,16 +244,53 @@ export default class VTTSegmentLoader extends SegmentLoader {
    *
    * @private
    */
-  handleSegment_() {
-    if (!this.pendingSegment_ || !this.subtitlesTrack_) {
+  segmentRequestFinished_(error, simpleSegment, result) {
+    if (!this.subtitlesTrack_) {
       this.state = 'READY';
       return;
     }
 
+    this.saveTransferStats_(simpleSegment.stats);
+
+    // the request was aborted
+    if (!this.pendingSegment_) {
+      this.state = 'READY';
+      this.mediaRequestsAborted += 1;
+      return;
+    }
+
+    if (error) {
+      if (error.code === REQUEST_ERRORS.TIMEOUT) {
+        this.handleTimeout_();
+      }
+
+      if (error.code === REQUEST_ERRORS.ABORTED) {
+        this.mediaRequestsAborted += 1;
+      } else {
+        this.mediaRequestsErrored += 1;
+      }
+
+      this.stopForError(error);
+      return;
+    }
+
+    const segmentInfo = this.pendingSegment_;
+
+    // although the VTT segment loader bandwidth isn't really used, it's good to
+    // maintain functionality between segment loaders
+    this.saveBandwidthRelatedStats_(segmentInfo.duration, simpleSegment.stats);
+
     this.state = 'APPENDING';
 
-    let segmentInfo = this.pendingSegment_;
-    let segment = segmentInfo.segment;
+    // used for tests
+    this.trigger('appending');
+
+    const segment = segmentInfo.segment;
+
+    if (segment.map) {
+      segment.map.bytes = simpleSegment.map.bytes;
+    }
+    segmentInfo.bytes = simpleSegment.bytes;
 
     // Make sure that vttjs has loaded, otherwise, wait till it finished loading
     if (typeof window.WebVTT !== 'function' &&
@@ -239,17 +300,15 @@ export default class VTTSegmentLoader extends SegmentLoader {
       let loadHandler;
       const errorHandler = () => {
         this.subtitlesTrack_.tech_.off('vttjsloaded', loadHandler);
-        this.error({
+        this.stopForError({
           message: 'Error loading vtt.js'
         });
-        this.state = 'READY';
-        this.pause();
-        this.trigger('error');
+        return;
       };
 
       loadHandler = () => {
         this.subtitlesTrack_.tech_.off('vttjserror', errorHandler);
-        this.handleSegment_();
+        this.segmentRequestFinished_(error, simpleSegment, result);
       };
 
       this.state = 'WAITING_ON_VTTJS';
@@ -264,17 +323,29 @@ export default class VTTSegmentLoader extends SegmentLoader {
     try {
       this.parseVTTCues_(segmentInfo);
     } catch (e) {
-      this.error({
+      this.stopForError({
         message: e.message
       });
-      this.state = 'READY';
-      this.pause();
-      return this.trigger('error');
+      return;
     }
 
-    this.updateTimeMapping_(segmentInfo,
-                            this.syncController_.timelines[segmentInfo.timeline],
-                            this.playlist_);
+    this.updateTimeMapping_(
+      segmentInfo,
+      this.syncController_.timelines[segmentInfo.timeline],
+      this.playlist_
+    );
+
+    if (segmentInfo.cues.length) {
+      segmentInfo.timingInfo = {
+        start: segmentInfo.cues[0].startTime,
+        end: segmentInfo.cues[segmentInfo.cues.length - 1].endTime
+      };
+    } else {
+      segmentInfo.timingInfo = {
+        start: segmentInfo.startOfSegment,
+        end: segmentInfo.startOfSegment + segmentInfo.duration
+      };
+    }
 
     if (segmentInfo.isSyncRequest) {
       this.trigger('syncinfoupdate');
@@ -287,17 +358,29 @@ export default class VTTSegmentLoader extends SegmentLoader {
 
     this.mediaSecondsLoaded += segment.duration;
 
-    if (segmentInfo.cues.length) {
-     // remove any overlapping cues to prevent doubling
-      this.remove(segmentInfo.cues[0].endTime,
-                  segmentInfo.cues[segmentInfo.cues.length - 1].endTime);
-    }
-
+    // Create VTTCue instances for each cue in the new segment and add them to
+    // the subtitle track
     segmentInfo.cues.forEach((cue) => {
-      this.subtitlesTrack_.addCue(cue);
+      this.subtitlesTrack_.addCue(this.featuresNativeTextTracks_ ?
+        new window.VTTCue(cue.startTime, cue.endTime, cue.text) :
+        cue);
     });
 
-    this.handleUpdateEnd_();
+    // Remove any duplicate cues from the subtitle track. The WebVTT spec allows
+    // cues to have identical time-intervals, but if the text is also identical
+    // we can safely assume it is a duplicate that can be removed (ex. when a cue
+    // "overlaps" VTT segments)
+    removeDuplicateCuesFromTrack(this.subtitlesTrack_);
+
+    this.handleAppendsDone_();
+  }
+
+  handleData_() {
+    // noop as we shouldn't be getting video/audio data captions
+    // that we do not support here.
+  }
+  updateTimingInfoEnd_() {
+    // noop
   }
 
   /**
@@ -318,15 +401,19 @@ export default class VTTSegmentLoader extends SegmentLoader {
       decodeBytesToString = true;
     }
 
-    const parser = new window.WebVTT.Parser(window,
-                                            window.vttjs,
-                                            decoder);
+    const parser = new window.WebVTT.Parser(
+      window,
+      window.vttjs,
+      decoder
+    );
 
     segmentInfo.cues = [];
     segmentInfo.timestampmap = { MPEGTS: 0, LOCAL: 0 };
 
     parser.oncue = segmentInfo.cues.push.bind(segmentInfo.cues);
-    parser.ontimestampmap = (map) => segmentInfo.timestampmap = map;
+    parser.ontimestampmap = (map) => {
+      segmentInfo.timestampmap = map;
+    };
     parser.onparsingerror = (error) => {
       videojs.log.warn('Error encountered when parsing cues: ' + error.message);
     };
@@ -383,7 +470,7 @@ export default class VTTSegmentLoader extends SegmentLoader {
     }
 
     const timestampmap = segmentInfo.timestampmap;
-    const diff = (timestampmap.MPEGTS / 90000) - timestampmap.LOCAL + mappingObj.mapping;
+    const diff = (timestampmap.MPEGTS / ONE_SECOND_IN_TS) - timestampmap.LOCAL + mappingObj.mapping;
 
     segmentInfo.cues.forEach((cue) => {
       // First convert cue time to TS time using the timestamp-map provided within the vtt

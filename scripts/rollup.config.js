@@ -1,138 +1,135 @@
-import babel from 'rollup-plugin-babel';
-import commonjs from 'rollup-plugin-commonjs';
-import json from 'rollup-plugin-json';
-import resolve from 'rollup-plugin-node-resolve';
-import uglify from 'rollup-plugin-uglify';
-import worker from '@gkatsev/rollup-plugin-bundle-worker';
-import { minify } from 'uglify-es';
-import pkg from '../package.json';
+const generate = require('videojs-generate-rollup-config');
+const worker = require('rollup-plugin-worker-factory');
+const {terser} = require('rollup-plugin-terser');
+const createTestData = require('./create-test-data.js');
+const replace = require('@rollup/plugin-replace');
+const strip = require('@rollup/plugin-strip');
 
-const date = new Date();
+const CI_TEST_TYPE = process.env.CI_TEST_TYPE || '';
 
-const banner =
-  `/**
- * ${pkg.name}
- * @version ${pkg.version}
- * @copyright ${date.getFullYear()} ${pkg.author}
- * @license ${pkg.license}
- */`;
+let syncWorker;
+// see https://github.com/videojs/videojs-generate-rollup-config
+// for options
+const options = {
+  input: 'src/videojs-http-streaming.js',
+  distName: 'videojs-http-streaming',
+  excludeCoverage(defaults) {
+    defaults.push(/^rollup-plugin-worker-factory/);
+    defaults.push(/^create-test-data!/);
 
-const umdPlugins = [
-  json(),
-  worker(),
-  resolve({
-    browser: true,
-    main: true,
-    jsnext: true
-  }),
-  commonjs({
-    sourceMap: false
-  }),
-  babel(),
-];
+    return defaults;
+  },
+  globals(defaults) {
+    defaults.browser['@xmldom/xmldom'] = 'window';
+    defaults.test['@xmldom/xmldom'] = 'window';
+    return defaults;
+  },
+  externals(defaults) {
+    return Object.assign(defaults, {
+      module: defaults.module.concat([
+        'aes-decrypter',
+        'm3u8-parser',
+        'mpd-parser',
+        'mux.js',
+        '@videojs/vhs-utils'
+      ])
+    });
+  },
+  plugins(defaults) {
+    // add worker and createTestData to the front of plugin lists
+    defaults.module.unshift('worker');
+    defaults.browser.unshift('worker');
+    // change this to `syncWorker` for syncronous web worker
+    // during unit tests
+    if (CI_TEST_TYPE === 'coverage') {
+      defaults.test.unshift('syncWorker');
+    } else {
+      defaults.test.unshift('worker');
+    }
+    defaults.test.unshift('createTestData');
 
-const externals = [
-  'aes-decrypter',
-  'global/document',
-  'global/window',
-  'm3u8-parser',
-  'mpd-parser',
-  'mux.js/lib/mp4',
-  'mux.js/lib/mp4/probe',
-  'mux.js/lib/tools/mp4-inspector',
-  'mux.js/lib/tools/ts-inspector.js',
-  'url-toolkit',
-  'video.js'
-];
+    if (CI_TEST_TYPE === 'playback-min') {
+      defaults.test.push('uglify');
+    }
 
-const onwarn = (warning) => {
-  if (warning.code === 'UNUSED_EXTERNAL_IMPORT' ||
-      warning.code === 'UNRESOLVED_IMPORT') {
-    return;
+    // istanbul is only in the list for regular builds and not watch
+    if (CI_TEST_TYPE !== 'coverage' && defaults.test.indexOf('istanbul') !== -1) {
+      defaults.test.splice(defaults.test.indexOf('istanbul'), 1);
+    }
+    defaults.module.unshift('replace');
+
+    defaults.module.unshift('strip');
+    defaults.browser.unshift('strip');
+
+    return defaults;
+  },
+  primedPlugins(defaults) {
+    defaults = Object.assign(defaults, {
+      replace: replace({
+        // single quote replace
+        "require('@videojs/vhs-utils/es": "require('@videojs/vhs-utils/cjs",
+        // double quote replace
+        'require("@videojs/vhs-utils/es': 'require("@videojs/vhs-utils/cjs'
+      }),
+      uglify: terser({
+        output: {comments: 'some'},
+        compress: {passes: 2}
+      }),
+      strip: strip({
+        functions: ['TEST_ONLY_*'],
+        debugger: false,
+        sourceMap: false
+      }),
+      createTestData: createTestData()
+    });
+
+    defaults.worker = worker({type: 'browser', plugins: [
+      defaults.resolve,
+      defaults.json,
+      defaults.commonjs,
+      defaults.babel
+    ]});
+
+    defaults.syncWorker = syncWorker = worker({type: 'mock', plugins: [
+      defaults.resolve,
+      defaults.json,
+      defaults.commonjs,
+      defaults.babel
+    ]});
+
+    return defaults;
+  },
+  babel(defaults) {
+    const presetEnvSettings = defaults.presets[0][1];
+
+    presetEnvSettings.exclude = presetEnvSettings.exclude || [];
+    presetEnvSettings.exclude.push('@babel/plugin-transform-typeof-symbol');
+
+    return defaults;
   }
-
-  // eslint-disable-next-line no-console
-  console.warn(warning.message);
 };
 
-export default [
-  /**
-   * Rollup configuration for packaging the plugin in a module that is consumable
-   * as the `src` of a `script` tag or via AMD or similar client-side loading.
-   *
-   * This module DOES include its dependencies.
-   */
-  {
-    input: 'src/videojs-http-streaming.js',
-    output: {
-      name: 'videojsHttpStreaming',
-      file: 'dist/videojs-http-streaming.js',
-      format: 'umd',
-      globals: {
-        'video.js': 'videojs'
-      },
-      banner
-    },
-    external: ['video.js'],
-    plugins: umdPlugins
-  }, {
-    input: 'src/videojs-http-streaming.js',
-    output: {
-      name: 'videojsHttpStreaming',
-      file: 'dist/videojs-http-streaming.min.js',
-      format: 'umd',
-      globals: {
-        'video.js': 'videojs'
-      },
-      banner,
-    },
-    external: ['video.js'],
-    plugins: umdPlugins
-      .concat([uglify({
-        output: {
-          comments: 'some'
-        }
-      }, minify)])
-  },
+if (CI_TEST_TYPE === 'playback' || CI_TEST_TYPE === 'playback-min') {
+  options.testInput = 'test/playback.test.js';
+} else if (CI_TEST_TYPE === 'unit' || CI_TEST_TYPE === 'coverage') {
+  options.testInput = {include: ['test/**/*.test.js'], exclude: ['test/playback.test.js']};
+}
 
-  /**
-   * Rollup configuration for packaging the plugin in a module that is consumable
-   * by either CommonJS (e.g. Node or Browserify) or ECMAScript (e.g. Rollup or webpack).
-   *
-   * These modules DO NOT include their dependencies as we expect those to be
-   * handled by the module system.
-   */
-  {
-    input: 'src/videojs-http-streaming.js',
-    plugins: [
-      json(),
-      worker(),
-      babel()
-    ],
-    output: [{
-      name: 'videojsHttpStreaming',
-      file: 'dist/videojs-http-streaming.cjs.js',
-      format: 'cjs',
-      banner
-    }],
-    external: externals,
-    onwarn
-  }, {
-    input: 'src/videojs-http-streaming.js',
-    plugins: [
-      json({
-        preferConst: true
-      }),
-      worker(),
-      babel()
-    ],
-    output: [{
-      name: 'videojsHttpStreaming',
-      file: 'dist/videojs-http-streaming.es.js',
-      format: 'es',
-      banner
-    }],
-    external: externals,
-    onwarn
-  }
-];
+const config = generate(options);
+
+if (config.builds.browser) {
+  config.builds.syncWorkers = config.makeBuild('browser', {
+    output: {
+      name: 'httpStreaming',
+      format: 'umd',
+      file: 'dist/videojs-http-streaming-sync-workers.js'
+    }
+  });
+
+  config.builds.syncWorkers.plugins[0] = syncWorker;
+}
+
+// Add additonal builds/customization here!
+
+// export the builds to rollup
+export default Object.values(config.builds);

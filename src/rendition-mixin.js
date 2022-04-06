@@ -1,19 +1,20 @@
-import { isIncompatible, isEnabled } from './playlist.js';
+import { isIncompatible, isEnabled, isAudioOnly } from './playlist.js';
+import { codecsForPlaylist } from './util/codecs.js';
 
 /**
  * Returns a function that acts as the Enable/disable playlist function.
  *
  * @param {PlaylistLoader} loader - The master playlist loader
- * @param {String} playlistUri - uri of the playlist
+ * @param {string} playlistID - id of the playlist
  * @param {Function} changePlaylistFn - A function to be called after a
  * playlist's enabled-state has been changed. Will NOT be called if a
  * playlist's enabled-state is unchanged
- * @param {Boolean=} enable - Value to set the playlist enabled-state to
+ * @param {boolean=} enable - Value to set the playlist enabled-state to
  * or if undefined returns the current enabled-state for the playlist
  * @return {Function} Function for setting/getting enabled
  */
-const enableFunction = (loader, playlistUri, changePlaylistFn) => (enable) => {
-  const playlist = loader.master.playlists[playlistUri];
+const enableFunction = (loader, playlistID, changePlaylistFn) => (enable) => {
+  const playlist = loader.master.playlists[playlistID];
   const incompatible = isIncompatible(playlist);
   const currentlyEnabled = isEnabled(playlist);
 
@@ -47,24 +48,28 @@ const enableFunction = (loader, playlistUri, changePlaylistFn) => (enable) => {
  * @class Representation
  */
 class Representation {
-  constructor(hlsHandler, playlist, id) {
+  constructor(vhsHandler, playlist, id) {
     const {
       masterPlaylistController_: mpc,
       options_: { smoothQualityChange }
-    } = hlsHandler;
+    } = vhsHandler;
     // Get a reference to a bound version of the quality change function
     const changeType = smoothQualityChange ? 'smooth' : 'fast';
     const qualityChangeFunction = mpc[`${changeType}QualityChange_`].bind(mpc);
 
     // some playlist attributes are optional
-    if (playlist.attributes.RESOLUTION) {
+    if (playlist.attributes) {
       const resolution = playlist.attributes.RESOLUTION;
 
-      this.width = resolution.width;
-      this.height = resolution.height;
+      this.width = resolution && resolution.width;
+      this.height = resolution && resolution.height;
+
+      this.bandwidth = playlist.attributes.BANDWIDTH;
     }
 
-    this.bandwidth = playlist.attributes.BANDWIDTH;
+    this.codecs = codecsForPlaylist(mpc.master(), playlist);
+
+    this.playlist = playlist;
 
     // The id is simply the ordinality of the media playlist
     // within the master playlist
@@ -72,28 +77,36 @@ class Representation {
 
     // Partially-apply the enableFunction to create a playlist-
     // specific variant
-    this.enabled = enableFunction(hlsHandler.playlists,
-                                  playlist.uri,
-                                  qualityChangeFunction);
+    this.enabled = enableFunction(
+      vhsHandler.playlists,
+      playlist.id,
+      qualityChangeFunction
+    );
   }
 }
 
 /**
  * A mixin function that adds the `representations` api to an instance
- * of the HlsHandler class
- * @param {HlsHandler} hlsHandler - An instance of HlsHandler to add the
+ * of the VhsHandler class
+ *
+ * @param {VhsHandler} vhsHandler - An instance of VhsHandler to add the
  * representation API into
  */
-let renditionSelectionMixin = function(hlsHandler) {
-  let playlists = hlsHandler.playlists;
+const renditionSelectionMixin = function(vhsHandler) {
 
-  // Add a single API-specific function to the HlsHandler instance
-  hlsHandler.representations = () => {
+  // Add a single API-specific function to the VhsHandler instance
+  vhsHandler.representations = () => {
+    const master = vhsHandler.masterPlaylistController_.master();
+    const playlists = isAudioOnly(master) ?
+      vhsHandler.masterPlaylistController_.getAudioTrackPlaylists_() :
+      master.playlists;
+
+    if (!playlists) {
+      return [];
+    }
     return playlists
-      .master
-      .playlists
       .filter((media) => !isIncompatible(media))
-      .map((e, i) => new Representation(hlsHandler, e, e.uri));
+      .map((e, i) => new Representation(vhsHandler, e, e.id));
   };
 };
 
