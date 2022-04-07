@@ -69,7 +69,7 @@ const options = {
         // single quote replace
         "require('@videojs/vhs-utils/es": "require('@videojs/vhs-utils/cjs",
         // double quote replace
-        'require("@videojs/vhs-utils/es': 'require("@videojs/vhs-utils/cjs'
+        'require("@videojs/vhs-utils/es': 'require("@videojs/vhs-utils/cjs',
       }),
       uglify: terser({
         output: {comments: 'some'},
